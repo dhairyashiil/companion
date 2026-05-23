@@ -2,7 +2,10 @@
   "name": "cal-companion",
   "version": "1.7.6",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "mobile": "cd apps/mobile && bunx expo start",
     "mobile:ios": "cd apps/mobile && bunx expo run:ios",
@@ -35,7 +38,7 @@
     "typescript": "5.9.3"
   },
   "lint-staged": {
-    "**/*.{js,jsx,ts,tsx,json,css,md}": [
+    "**/*.{js,jsx,ts,tsx,json,css}": [
       "biome format --write"
     ]
   },
