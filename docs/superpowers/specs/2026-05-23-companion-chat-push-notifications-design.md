@@ -18,17 +18,18 @@ Existing flows are unchanged: the Cal.com webhook handler (`/api/webhooks/calcom
 
 ```
 apps/chat/
-├── app/api/notifications/deliver/route.ts      ← NEW: auth + routing
+├── app/api/notifications/deliver/route.ts      ← NEW: auth + body validation only
 └── lib/
     ├── push-notifications/
-    │   ├── formatter.ts                        ← NEW: buildPushCard(payload)
+    │   ├── formatter.ts                        ← NEW: ChatPushPayload type + buildPushCard()
     │   ├── deliver-slack.ts                    ← NEW: per-identifier Slack DM
-    │   └── deliver-telegram.ts                 ← NEW: per-identifier Telegram send
+    │   ├── deliver-telegram.ts                 ← NEW: per-identifier Telegram send
+    │   └── service.ts                          ← NEW: deliverNotifications() fan-out
     ├── calcom/
-    │   └── client.ts                           ← MODIFY: add subscription methods
+    │   └── client.ts                           ← MODIFY: add 4 subscription methods
     ├── handlers/
     │   ├── slack.ts                            ← MODIFY: add "notify" subcommand
-    │   └── telegram.ts                         ← MODIFY: add /notify command
+    │   └── telegram.ts                         ← MODIFY: add "notify" to TELEGRAM_COMMANDS + handler
     └── env.ts                                  ← MODIFY: validate CALCOM_DELIVERY_SECRET
 ```
 
@@ -38,15 +39,24 @@ apps/chat/
 
 ### 1. `POST /api/notifications/deliver` route
 
-**Auth:** Reads `x-cal-delivery-secret` header, compares with `CALCOM_DELIVERY_SECRET` env var using constant-time comparison (`timingSafeEqual`). Returns 401 if missing or wrong. Returns 400 if body fails schema validation.
+**Auth:** Reads `x-cal-delivery-secret` header, compares with `CALCOM_DELIVERY_SECRET` env var using constant-time comparison (`timingSafeEqual`) — same pattern as `lib/calcom/webhooks.ts` and `lib/calcom/oauth.ts`. Returns 401 if missing or wrong. Returns 400 if body fails schema validation.
 
-**Input schema:**
+The route stays thin — auth + parse body + delegate:
+
 ```ts
-type DeliverRequest = {
-  platform: "SLACK" | "TELEGRAM";
-  subscriptions: Array<{ identifier: string; teamId?: string }>;
-  payload: ChatPushPayload;
-};
+export async function POST(request: Request) {
+  // 1. verify secret → 401
+  // 2. parse + validate body → 400
+  // 3. const results = await deliverNotifications(body)
+  // 4. return Response.json({ results })
+}
+```
+
+**Input schema (discriminated union — `teamId` required for Slack, absent for Telegram):**
+```ts
+type DeliverRequest =
+  | { platform: "SLACK";    subscriptions: Array<{ identifier: string; teamId: string }>; payload: ChatPushPayload }
+  | { platform: "TELEGRAM"; subscriptions: Array<{ identifier: string }>;                  payload: ChatPushPayload };
 ```
 
 **Output:**
@@ -54,104 +64,148 @@ type DeliverRequest = {
 { results: Array<{ identifier: string; success: boolean; invalidIdentifier?: boolean }> }
 ```
 
-**Routing:** Delegates to `deliverSlack` or `deliverTelegram` per identifier. Collects results. Always returns 200 with the results array — errors are per-identifier, not HTTP-level (except auth failure).
+Always returns 200 with the results array — errors are per-identifier, not HTTP-level (except auth/parse failure).
 
 ---
 
-### 2. `lib/push-notifications/formatter.ts`
+### 2. `lib/push-notifications/service.ts`
 
-Defines the `ChatPushPayload` type (mirrors `/cal`'s type — no cross-repo import needed) and exports a single function:
+Owns the fan-out logic, keeping the route handler dumb:
 
 ```ts
-export function buildPushCard(payload: ChatPushPayload): ReturnType<typeof Card>
+export async function deliverNotifications(request: DeliverRequest): Promise<DeliverResult[]>
 ```
 
-Renders using the existing Chat SDK components (`Card`, `Fields`, `Field`, `Divider`, `Actions`, `LinkButton`) — same pattern as `lib/notifications.ts`. The Card SDK handles both Slack Block Kit and Telegram formatting transparently.
+- Calls `buildPushCard(request.payload)` once to build the shared card
+- Fans out to all identifiers via `Promise.allSettled()` (parallel delivery)
+- Delegates per-identifier work to `deliverSlack` or `deliverTelegram`
+- Returns the flat results array
 
-**Card layout (matches approved visual):**
-- `title`: event badge — e.g. `"✅ Booking Confirmed"`, `"❌ Booking Cancelled"`, `"🔄 Booking Rescheduled"`, `"🕐 Booking Requested"`, `"🚫 Booking Rejected"`
-- `subtitle`: booking title (e.g. `"Bi-Weekly Morale Talk"`)
-- `Fields`:
-  - `When`: formatted time range with timezone using a local `formatPushTime(start, end, timeZone)` helper
-  - `Hosts`: comma-joined `name · email` — omitted if array is empty
-  - `Attendees`: same format — omitted if array is empty
-  - `Meeting`: meeting URL as a link — omitted if absent; falls back to `Location` field if `meetingUrl` is absent but `location` is present
-  - `Reason`: cancellation reason — only present when `notificationType === "BOOKING_CANCELLED"` and `cancellationReason` is set
-- `Actions`: single `LinkButton({ url: payload.data.url, label: "View Booking" })`
+`Promise.allSettled` is appropriate: the subscriber count per request is bounded by a single booking's subscriber list (typically <50), well within Slack's rate limits for bot DMs.
 
 ---
 
-### 3. `lib/push-notifications/deliver-slack.ts`
+### 3. `lib/push-notifications/formatter.ts`
+
+Defines `ChatPushPayload` locally — mirrors `/cal` PR #2927's type, no cross-repo import needed. A comment in the file links to PR #2927 so future drift is detectable.
+
+```ts
+// Mirrors ChatPushPayload from calcom/cal PR #2927 (packages/features/notifications/send-chat-push-notification.ts)
+export type ChatPushPayload = { ... }
+```
+
+Exports:
+
+```ts
+export function buildPushCard(payload: ChatPushPayload): ChatElement
+```
+
+Return type is `ChatElement` (the Chat SDK's generic element type) — more portable than `ReturnType<typeof Card>`.
+
+Renders using existing Chat SDK components (`Card`, `Fields`, `Field`, `Divider`, `Actions`, `LinkButton`) — same pattern as `lib/notifications.ts`:
+
+**Card layout (matches approved visual):**
+- `title`: event badge with emoji per type:
+  - `"✅ Booking Confirmed"` / `"❌ Booking Cancelled"` / `"🔄 Booking Rescheduled"` / `"🕐 Booking Requested"` / `"🚫 Booking Rejected"`
+- `subtitle`: booking title (e.g. `"Bi-Weekly Morale Talk"`)
+- `Fields`:
+  - `When`: `formatPushTime(start, end, timeZone)` — local helper formatting ISO strings + timezone into `"Wed Jun 3 · 4:00–4:30 PM IST"`
+  - `Hosts`: `name · email` joined by `, ` — omitted if empty array
+  - `Attendees`: same format — omitted if empty array
+  - `Meeting`: `meetingUrl` as a link — falls back to `Location` plain text if `meetingUrl` absent but `location` present; omitted if both absent
+  - `Reason`: cancellation reason — only when `notificationType === "BOOKING_CANCELLED"` and `cancellationReason` is set
+- `Actions`: `LinkButton({ url: payload.data?.url ?? "https://app.cal.com/bookings", label: "View Booking" })`
+
+---
+
+### 4. `lib/push-notifications/deliver-slack.ts`
 
 ```ts
 export async function deliverSlack(
-  identifier: string,   // Slack user ID (U...)
-  teamId: string,       // Slack workspace ID (T...)
-  card: Card,
-): Promise<{ success: boolean; invalidIdentifier?: boolean }>
+  identifier: string,  // Slack user ID (U...)
+  teamId: string,      // Slack workspace ID (T...)
+  card: ChatElement,
+): Promise<DeliverResult>
 ```
 
-Uses the existing pattern from `app/api/webhooks/calcom/route.ts`:
-1. `slackAdapter.getInstallation(teamId)` — returns null if the workspace uninstalled the app → `invalidIdentifier: true`
+Uses the existing pattern from `app/api/webhooks/calcom/route.ts:108-114`:
+1. `slackAdapter.getInstallation(teamId)` — null → `invalidIdentifier: true` (workspace uninstalled)
 2. `slackAdapter.withBotToken(installation.botToken, () => bot.channel("slack:" + identifier).post(card))`
-3. Catches Slack API errors: channel not found / user not found → `invalidIdentifier: true`; other errors → `success: false`
+3. Catches Slack API error strings → `invalidIdentifier: true` for: `channel_not_found`, `not_in_channel`, `account_inactive`; all other errors → `success: false`
 
 ---
 
-### 4. `lib/push-notifications/deliver-telegram.ts`
+### 5. `lib/push-notifications/deliver-telegram.ts`
 
 ```ts
 export async function deliverTelegram(
-  identifier: string,   // Telegram chat ID (numeric string)
-  card: Card,
-): Promise<{ success: boolean; invalidIdentifier?: boolean }>
+  identifier: string,  // Telegram chat ID (numeric string)
+  card: ChatElement,
+): Promise<DeliverResult>
 ```
 
-Simpler — no workspace lookup needed:
 1. `bot.channel("telegram:" + identifier).post(card)`
 2. Catches errors: chat not found → `invalidIdentifier: true`; other errors → `success: false`
 
 ---
 
-### 5. Subscribe/unsubscribe slash commands
+### 6. Subscribe/unsubscribe slash commands
 
 **Slack — `/cal notify on|off`**
 
-Added to the existing `switch(subcommand)` in `lib/handlers/slack.ts`:
+Added as `case "notify":` to the existing `switch(subcommand)` in `lib/handlers/slack.ts:394`:
 
-- `on`: Requires linked Cal.com account (existing `getValidAccessToken` pattern). Calls `registerSlackSubscription({ identifier: userId, deviceId: teamId })`. Replies ephemeral: `"✅ You'll now receive booking notifications here."`
-- `off`: Calls `removeSlackSubscription({ identifier: userId })`. Replies ephemeral: `"🔕 Booking push notifications turned off."`
-- Unknown arg: replies ephemeral with usage hint: `` "`/cal notify on` or `/cal notify off`" ``
+- `on`: `getValidAccessToken` (existing pattern) → error if not linked → `registerSlackSubscription(accessToken, { identifier: userId, deviceId: teamId })` → ephemeral `"✅ You'll now receive booking notifications here."`
+- `off`: `removeSlackSubscription(accessToken, { identifier: userId })` → ephemeral `"🔕 Booking push notifications turned off."`
+- No arg / unknown: ephemeral usage hint: `` "Usage: `/cal notify on` or `/cal notify off`" ``
+
+No Slack manifest changes needed — `/cal notify` is a subcommand of the existing `/cal` command.
 
 **Telegram — `/notify on|off`**
 
-Added to `lib/handlers/telegram.ts` following the existing command handler pattern:
+Two code changes required (not just BotFather config):
+1. Add `"notify"` to `TELEGRAM_COMMANDS` array at `lib/handlers/telegram.ts:45` — this updates the `TELEGRAM_COMMAND_RE` regex automatically since it's built from that array
+2. Add `if (cmd === "notify")` handler block following the existing if-chain pattern
 
-- `on`: Requires linked account. Calls `registerTelegramSubscription({ identifier: chatId })`. Replies: `"✅ You'll now receive booking notifications here."`
-- `off`: Calls `removeTelegramSubscription({ identifier: chatId })`. Replies: `"🔕 Booking push notifications turned off."`
+- `on`: linked account required → `registerTelegramSubscription(accessToken, { identifier: chatId })` → `"✅ You'll now receive booking notifications here."`
+- `off`: `removeTelegramSubscription(accessToken, { identifier: chatId })` → `"🔕 Booking push notifications turned off."`
+
+BotFather: add `/notify - Toggle booking push notifications on/off` as an operational step after deployment.
 
 ---
 
-### 6. Cal.com client extension (`lib/calcom/client.ts`)
+### 7. Cal.com client extension (`lib/calcom/client.ts`)
 
-Four new functions added alongside existing ones, all using `fetchWithRetry` and authenticated with the user's access token:
+Four new exported functions using `fetchWithRetry` + user `accessToken` — identical pattern to existing `cancelBooking`, `rescheduleBooking` etc.:
 
 ```ts
-registerSlackSubscription(accessToken, input: { identifier: string; deviceId: string }): Promise<void>
-removeSlackSubscription(accessToken, input: { identifier: string }): Promise<void>
-registerTelegramSubscription(accessToken, input: { identifier: string }): Promise<void>
-removeTelegramSubscription(accessToken, input: { identifier: string }): Promise<void>
+// Endpoints confirmed from /cal PR #2927 (apps/api/v2/.../notifications-chat-subscriptions.controller.ts)
+registerSlackSubscription(accessToken: string, input: { identifier: string; deviceId: string }): Promise<void>
+  // POST /v2/notifications/subscriptions/slack
+
+removeSlackSubscription(accessToken: string, input: { identifier: string }): Promise<void>
+  // DELETE /v2/notifications/subscriptions/slack
+
+registerTelegramSubscription(accessToken: string, input: { identifier: string }): Promise<void>
+  // POST /v2/notifications/subscriptions/telegram
+
+removeTelegramSubscription(accessToken: string, input: { identifier: string }): Promise<void>
+  // DELETE /v2/notifications/subscriptions/telegram
 ```
 
-Endpoints: `POST /v2/notifications/subscriptions/slack`, `DELETE /v2/notifications/subscriptions/slack`, and Telegram equivalents. All return 200/201 on success; throw `CalcomApiError` on failure (handled by the calling slash command handler).
+All throw `CalcomApiError` on failure, handled by the slash command's existing `friendlyCalcomError` helper.
 
 ---
 
-### 7. Environment variables
+### 8. Environment variables
 
 **New:** `CALCOM_DELIVERY_SECRET` — must match `CALCOM_CHAT_DELIVERY_SECRET` on the `/cal` side.
 
-Added to `lib/env.ts` validation (warn if missing in development, hard fail in production). Added to `.env.example` with description.
+Validation in `lib/env.ts` matching the `REDIS_URL` pattern (line 19-23):
+- Production: added to `missing` array → hard fail on startup
+- Development: `console.warn` only (same as REDIS_URL behaviour)
+
+Added to `.env.example` with description.
 
 ---
 
@@ -159,13 +213,15 @@ Added to `lib/env.ts` validation (warn if missing in development, hard fail in p
 
 | Scenario | Behavior |
 |---|---|
-| Wrong/missing delivery secret | 401, no body |
-| Malformed request body | 400, no body |
-| Slack workspace uninstalled | `invalidIdentifier: true` — `/cal` will clean up the subscription |
+| Wrong/missing `x-cal-delivery-secret` | 401, no body |
+| Malformed / invalid request body | 400, no body |
+| Slack workspace uninstalled (`getInstallation` → null) | `invalidIdentifier: true` — `/cal` cleans up subscription |
+| Slack errors: `channel_not_found`, `not_in_channel`, `account_inactive` | `invalidIdentifier: true` |
+| Slack transient error | `success: false` |
 | Telegram chat not found | `invalidIdentifier: true` |
-| Transient delivery error | `success: false`, `/cal` retries on next event |
-| `/cal notify on` — user not linked | Ephemeral error: "Link your Cal.com account first with `/cal link`" |
-| `/cal notify on` — API error | Ephemeral error with friendly message via existing `friendlyCalcomError` helper |
+| Telegram transient error | `success: false` |
+| `/cal notify on` — user not linked | Ephemeral: "Link your Cal.com account first with `/cal link`" |
+| `/cal notify on/off` — API error | Ephemeral via existing `friendlyCalcomError` helper |
 
 ---
 
@@ -173,6 +229,6 @@ Added to `lib/env.ts` validation (warn if missing in development, hard fail in p
 
 - No changes to the existing Cal.com webhook flow (`/api/webhooks/calcom`)
 - No new Redis state (subscriptions live in `/cal` Prisma)
-- Feature flag (`chat-push-notifications`) is controlled on `/cal` side — chat app is always ready to receive once deployed
-- No Slack manifest changes (no new slash commands — `/cal notify` is a subcommand of existing `/cal`)
-- Telegram: `/notify` is a new bot command — update BotFather description but no code change needed
+- Feature flag (`chat-push-notifications`) controlled on `/cal` side — chat app is always ready once deployed
+- No Slack manifest changes (`/cal notify` is a subcommand of existing `/cal`)
+- No rate limiting on the deliver endpoint — subscriber count per request is bounded by a single booking's list; `/cal` manages batching
